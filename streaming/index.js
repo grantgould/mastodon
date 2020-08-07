@@ -12,7 +12,7 @@ const uuid = require('uuid');
 const fs = require('fs');
 
 const env = process.env.NODE_ENV || 'development';
-const alwaysRequireAuth = process.env.WHITELIST_MODE === 'true' || process.env.AUTHORIZED_FETCH === 'true';
+const alwaysRequireAuth = process.env.LIMITED_FEDERATION_MODE === 'true' || process.env.WHITELIST_MODE === 'true' || process.env.AUTHORIZED_FETCH === 'true';
 
 dotenv.config({
   path: env === 'production' ? '.env.production' : '.env',
@@ -108,6 +108,7 @@ const startWorker = (workerId) => {
   }
 
   const app = express();
+
   app.set('trusted proxy', process.env.TRUSTED_PROXY_IP || 'loopback,uniquelocal');
 
   const pgPool = new pg.Pool(Object.assign(pgConfigs[env], dbUrlToConfig(process.env.DATABASE_URL)));
@@ -167,16 +168,24 @@ const startWorker = (workerId) => {
   const subscribe = (channel, callback) => {
     log.silly(`Adding listener for ${channel}`);
     subs[channel] = subs[channel] || [];
+
     if (subs[channel].length === 0) {
       log.verbose(`Subscribe ${channel}`);
       redisSubscribeClient.subscribe(channel);
     }
+
     subs[channel].push(callback);
   };
 
   const unsubscribe = (channel, callback) => {
     log.silly(`Removing listener for ${channel}`);
+
+    if (!subs[channel]) {
+      return;
+    }
+
     subs[channel] = subs[channel].filter(item => item !== callback);
+
     if (subs[channel].length === 0) {
       log.verbose(`Unsubscribe ${channel}`);
       redisSubscribeClient.unsubscribe(channel);
@@ -204,10 +213,10 @@ const startWorker = (workerId) => {
     next();
   };
 
-  const accountFromToken = (token, allowedScopes, req, next) => {
+  const accountFromToken = (token, req) => new Promise((resolve, reject) => {
     pgPool.connect((err, client, done) => {
       if (err) {
-        next(err);
+        reject(err);
         return;
       }
 
@@ -215,7 +224,7 @@ const startWorker = (workerId) => {
         done();
 
         if (err) {
-          next(err);
+          reject(err);
           return;
         }
 
@@ -223,54 +232,79 @@ const startWorker = (workerId) => {
           err = new Error('Invalid access token');
           err.statusCode = 401;
 
-          next(err);
+          reject(err);
           return;
         }
 
-        const scopes = result.rows[0].scopes.split(' ');
-
-        if (allowedScopes.size > 0 && !scopes.some(scope => allowedScopes.includes(scope))) {
-          err = new Error('Access token does not cover required scopes');
-          err.statusCode = 401;
-
-          next(err);
-          return;
-        }
-
+        req.scopes = result.rows[0].scopes.split(' ');
         req.accountId = result.rows[0].account_id;
         req.chosenLanguages = result.rows[0].chosen_languages;
-        req.allowNotifications = scopes.some(scope => ['read', 'read:notifications'].includes(scope));
+        req.allowNotifications = req.scopes.some(scope => ['read', 'read:notifications'].includes(scope));
         req.deviceId = result.rows[0].device_id;
 
-        next();
+        resolve();
       });
     });
-  };
+  });
 
-  const accountFromRequest = (req, next, required = true, allowedScopes = ['read']) => {
+  const accountFromRequest = (req, required = true) => new Promise((resolve, reject) => {
     const authorization = req.headers.authorization;
-    const location = url.parse(req.url, true);
-    const accessToken = location.query.access_token || req.headers['sec-websocket-protocol'];
+    const location      = url.parse(req.url, true);
+    const accessToken   = location.query.access_token || req.headers['sec-websocket-protocol'];
 
     if (!authorization && !accessToken) {
       if (required) {
         const err = new Error('Missing access token');
         err.statusCode = 401;
 
-        next(err);
+        reject(err);
         return;
       } else {
-        next();
+        resolve();
         return;
       }
     }
 
     const token = authorization ? authorization.replace(/^Bearer /, '') : accessToken;
 
-    accountFromToken(token, allowedScopes, req, next);
+    resolve(accountFromToken(token, req));
+  });
+
+  const channelNameFromPath = req => {
+    const { path } = req;
+
+    // The channel names
+    //
+    // - public:media
+    // - public:local:media
+    // - public:remote:media
+    //
+    // are not represented below because they do not correspond to
+    // stand-alone paths and are instead controlled by query parameters
+
+    switch(path) {
+    case '/api/v1/streaming/user':
+      return 'user';
+    case '/api/v1/streaming/user/notification':
+      return 'user:notification';
+    case '/api/v1/streaming/public':
+      return 'public';
+    case '/api/v1/streaming/public/local':
+      return 'public:local';
+    case '/api/v1/streaming/public/remote':
+      return 'public:remote';
+    case '/api/v1/streaming/hashtag':
+      return 'hashtag';
+    case '/api/v1/streaming/hashtag/local':
+      return 'hashtag:local';
+    case '/api/v1/streaming/direct':
+      return 'direct';
+    case '/api/v1/streaming/list':
+      return 'list';
+    }
   };
 
-  const PUBLIC_STREAMS = [
+  const PUBLIC_CHANNELS = [
     'public',
     'public:media',
     'public:local',
@@ -281,37 +315,56 @@ const startWorker = (workerId) => {
     'hashtag:local',
   ];
 
-  const wsVerifyClient = (info, cb) => {
-    const location = url.parse(info.req.url, true);
-    const authRequired = alwaysRequireAuth || !PUBLIC_STREAMS.some(stream => stream === location.query.stream);
-    const allowedScopes = [];
+  const checkScopes = (req, channelName) => new Promise((resolve, reject) => {
+    log.silly(req.requestId, `Checking OAuth scopes for ${channelName}`);
 
-    if (authRequired) {
-      allowedScopes.push('read');
-      if (location.query.stream === 'user:notification') {
-        allowedScopes.push('read:notifications');
-      } else {
-        allowedScopes.push('read:statuses');
-      }
+    // When accessing public channels, no scopes are needed
+    if (PUBLIC_CHANNELS.includes(channelName)) {
+      resolve();
+      return;
     }
 
-    accountFromRequest(info.req, err => {
-      if (!err) {
-        cb(true, undefined, undefined);
-      } else {
-        log.error(info.req.requestId, err.toString());
-        cb(false, 401, 'Unauthorized');
-      }
-    }, authRequired, allowedScopes);
-  };
+    // The `read` scope has the highest priority, if the token has it
+    // then it can access all streams
+    const requiredScopes = ['read'];
 
-  const PUBLIC_ENDPOINTS = [
-    '/api/v1/streaming/public',
-    '/api/v1/streaming/public/local',
-    '/api/v1/streaming/public/remote',
-    '/api/v1/streaming/hashtag',
-    '/api/v1/streaming/hashtag/local',
-  ];
+    // When accessing specifically the notifications stream,
+    // we need a read:notifications, while in all other cases,
+    // we can allow access with read:statuses. Mind that the
+    // user stream will not contain notifications unless
+    // the token has either read or read:notifications scope
+    // as well, this is handled separately.
+    if (channelName === 'user:notification') {
+      requiredScopes.push('read:notifications');
+    } else {
+      requiredScopes.push('read:statuses');
+    }
+
+    if (requiredScopes.some(requiredScope => req.scopes.includes(requiredScope))) {
+      resolve();
+      return;
+    }
+
+    const err = new Error('Access token does not cover required scopes');
+    err.statusCode = 401;
+
+    reject(err);
+  });
+
+  const wsVerifyClient = (info, callback) => {
+    // When verifying the websockets connection, we no longer pre-emptively
+    // check OAuth scopes and drop the connection if they're missing. We only
+    // drop the connection if access without token is not allowed by environment
+    // variables. OAuth scope checks are moved to the point of subscription
+    // to a specific stream.
+
+    accountFromRequest(info.req, alwaysRequireAuth).then(() => {
+      callback(true, undefined, undefined);
+    }).catch(err => {
+      log.error(info.req.requestId, err.toString());
+      callback(false, 401, 'Unauthorized');
+    });
+  };
 
   const authenticationMiddleware = (req, res, next) => {
     if (req.method === 'OPTIONS') {
@@ -319,19 +372,11 @@ const startWorker = (workerId) => {
       return;
     }
 
-    const authRequired = alwaysRequireAuth || !PUBLIC_ENDPOINTS.some(endpoint => endpoint === req.path);
-    const allowedScopes = [];
-
-    if (authRequired) {
-      allowedScopes.push('read');
-      if (req.path === '/api/v1/streaming/user/notification') {
-        allowedScopes.push('read:notifications');
-      } else {
-        allowedScopes.push('read:statuses');
-      }
-    }
-
-    accountFromRequest(req, next, authRequired, allowedScopes);
+    accountFromRequest(req, alwaysRequireAuth).then(() => checkScopes(req, channelNameFromPath(req))).then(() => {
+      next();
+    }).catch(err => {
+      next(err);
+    });
   };
 
   const errorMiddleware = (err, req, res, {}) => {
@@ -342,25 +387,27 @@ const startWorker = (workerId) => {
 
   const placeholders = (arr, shift = 0) => arr.map((_, i) => `$${i + 1 + shift}`).join(', ');
 
-  const authorizeListAccess = (id, req, next) => {
+  const authorizeListAccess = (listId, req) => new Promise((resolve, reject) => {
+    const { accountId } = req;
+
     pgPool.connect((err, client, done) => {
       if (err) {
-        next(false);
+        reject();
         return;
       }
 
-      client.query('SELECT id, account_id FROM lists WHERE id = $1 LIMIT 1', [id], (err, result) => {
+      client.query('SELECT id, account_id FROM lists WHERE id = $1 LIMIT 1', [listId], (err, result) => {
         done();
 
-        if (err || result.rows.length === 0 || result.rows[0].account_id !== req.accountId) {
-          next(false);
+        if (err || result.rows.length === 0 || result.rows[0].account_id !== accountId) {
+          reject();
           return;
         }
 
-        next(true);
+        resolve();
       });
     });
-  };
+  });
 
   const streamFrom = (ids, req, output, attachCloseHandler, needsFiltering = false, notificationOnly = false) => {
     const accountId  = req.accountId || req.remoteAddress;
@@ -447,7 +494,11 @@ const startWorker = (workerId) => {
       subscribe(`${redisPrefix}${id}`, listener);
     });
 
-    attachCloseHandler(ids.map(id => `${redisPrefix}${id}`), listener);
+    if (attachCloseHandler) {
+      attachCloseHandler(ids.map(id => `${redisPrefix}${id}`), listener);
+    }
+
+    return listener;
   };
 
   // Setup stream output to HTTP
@@ -491,34 +542,13 @@ const startWorker = (workerId) => {
   };
 
   // Setup stream output to WebSockets
-  const streamToWs = (req, ws) => (event, payload) => {
+  const streamToWs = (req, ws, streamName) => (event, payload) => {
     if (ws.readyState !== ws.OPEN) {
       log.error(req.requestId, 'Tried writing to closed socket');
       return;
     }
 
-    ws.send(JSON.stringify({ event, payload }));
-  };
-
-  // Setup stream end for WebSockets
-  const streamWsEnd = (req, ws, closeHandler = false) => (id, listener) => {
-    const accountId = req.accountId || req.remoteAddress;
-
-    ws.on('close', () => {
-      log.verbose(req.requestId, `Ending stream for ${accountId}`);
-      unsubscribe(id, listener);
-      if (closeHandler) {
-        closeHandler();
-      }
-    });
-
-    ws.on('error', () => {
-      log.verbose(req.requestId, `Ending stream for ${accountId}`);
-      unsubscribe(id, listener);
-      if (closeHandler) {
-        closeHandler();
-      }
-    });
+    ws.send(JSON.stringify({ stream: streamName, event, payload }));
   };
 
   const httpNotFound = res => {
@@ -539,157 +569,317 @@ const startWorker = (workerId) => {
   app.use(errorMiddleware);
 
   app.get('/api/v1/streaming/user', (req, res) => {
-    const channels = [`timeline:${req.accountId}`];
+    channelNameToIds(req, 'user', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
 
-    if (req.deviceId) {
-      channels.push(`timeline:${req.accountId}:${req.deviceId}`);
-    }
-
-    streamFrom(channels, req, streamToHttp(req, res), streamHttpEnd(req, subscriptionHeartbeat(channels)));
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
+    });
   });
 
   app.get('/api/v1/streaming/user/notification', (req, res) => {
-    streamFrom(`timeline:${req.accountId}`, req, streamToHttp(req, res), streamHttpEnd(req), false, true);
+    channelNameToIds(req, 'user:notification', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
+
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
+    });
   });
 
   app.get('/api/v1/streaming/public', (req, res) => {
     const onlyMedia = req.query.only_media === '1' || req.query.only_media === 'true';
-    const channel   = onlyMedia ? 'timeline:public:media' : 'timeline:public';
 
-    streamFrom(channel, req, streamToHttp(req, res), streamHttpEnd(req), true);
+    channelNameToIds(req, onlyMedia ? 'public:media' : 'public', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
+
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
+    });
   });
 
   app.get('/api/v1/streaming/public/local', (req, res) => {
     const onlyMedia = req.query.only_media === '1' || req.query.only_media === 'true';
-    const channel   = onlyMedia ? 'timeline:public:local:media' : 'timeline:public:local';
 
-    streamFrom(channel, req, streamToHttp(req, res), streamHttpEnd(req), true);
+    channelNameToIds(req, onlyMedia ? 'public:local:media' : 'public:local', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
+
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
+    });
   });
 
   app.get('/api/v1/streaming/public/remote', (req, res) => {
     const onlyMedia = req.query.only_media === '1' || req.query.only_media === 'true';
-    const channel   = onlyMedia ? 'timeline:public:remote:media' : 'timeline:public:remote';
 
-    streamFrom(channel, req, streamToHttp(req, res), streamHttpEnd(req), true);
+    channelNameToIds(req, onlyMedia ? 'public:remote:media' : 'public:remote', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
+
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
+    });
   });
 
   app.get('/api/v1/streaming/direct', (req, res) => {
-    const channel = `timeline:direct:${req.accountId}`;
-    streamFrom(channel, req, streamToHttp(req, res), streamHttpEnd(req, subscriptionHeartbeat(channel)), true);
+    channelNameToIds(req, 'direct', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
+
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
+    });
   });
 
   app.get('/api/v1/streaming/hashtag', (req, res) => {
-    const { tag } = req.query;
+    channelNameToIds(req, 'hashtag', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
 
-    if (!tag || tag.length === 0) {
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
       httpNotFound(res);
-      return;
-    }
-
-    streamFrom(`timeline:hashtag:${tag.toLowerCase()}`, req, streamToHttp(req, res), streamHttpEnd(req), true);
+    });
   });
 
   app.get('/api/v1/streaming/hashtag/local', (req, res) => {
-    const { tag } = req.query;
+    channelNameToIds(req, 'hashtag:local', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
 
-    if (!tag || tag.length === 0) {
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
       httpNotFound(res);
-      return;
-    }
-
-    streamFrom(`timeline:hashtag:${tag.toLowerCase()}:local`, req, streamToHttp(req, res), streamHttpEnd(req), true);
+    });
   });
 
   app.get('/api/v1/streaming/list', (req, res) => {
-    const listId = req.query.list;
+    channelNameToIds(req, 'list', req.query).then(({ channelIds, options }) => {
+      const onSend = streamToHttp(req, res);
+      const onEnd  = streamHttpEnd(req, subscriptionHeartbeat(channelIds));
 
-    authorizeListAccess(listId, req, authorized => {
-      if (!authorized) {
-        httpNotFound(res);
-        return;
-      }
-
-      const channel = `timeline:list:${listId}`;
-      streamFrom(channel, req, streamToHttp(req, res), streamHttpEnd(req, subscriptionHeartbeat(channel)));
+      streamFrom(channelIds, req, onSend, onEnd, options.needsFiltering, options.notificationOnly);
+    }).catch(err => {
+      log.verbose(req.requestId, 'Subscription error:', err.toString());
+      httpNotFound(res);
     });
   });
 
   const wss = new WebSocketServer({ server, verifyClient: wsVerifyClient });
 
-  wss.on('connection', (ws, req) => {
-    const location = url.parse(req.url, true);
-    req.requestId  = uuid.v4();
-    req.remoteAddress = ws._socket.remoteAddress;
-
-    let channel;
-
-    switch(location.query.stream) {
+  const channelNameToIds = (req, name, params) => new Promise((resolve, reject) => {
+    switch(name) {
     case 'user':
-      channel = [`timeline:${req.accountId}`];
+      resolve({
+        channelIds: req.deviceId ? [`timeline:${req.accountId}`, `timeline:${req.accountId}:${req.deviceId}`] : [`timeline:${req.accountId}`],
+        options: { needsFiltering: false, notificationOnly: false },
+      });
 
-      if (req.deviceId) {
-        channel.push(`timeline:${req.accountId}:${req.deviceId}`);
-      }
-
-      streamFrom(channel, req, streamToWs(req, ws), streamWsEnd(req, ws, subscriptionHeartbeat(channel)));
       break;
     case 'user:notification':
-      streamFrom(`timeline:${req.accountId}`, req, streamToWs(req, ws), streamWsEnd(req, ws), false, true);
+      resolve({
+        channelIds: [`timeline:${req.accountId}`],
+        options: { needsFiltering: false, notificationOnly: true },
+      });
+
       break;
     case 'public':
-      streamFrom('timeline:public', req, streamToWs(req, ws), streamWsEnd(req, ws), true);
+      resolve({
+        channelIds: ['timeline:public'],
+        options: { needsFiltering: true, notificationOnly: false },
+      });
+
       break;
     case 'public:local':
-      streamFrom('timeline:public:local', req, streamToWs(req, ws), streamWsEnd(req, ws), true);
+      resolve({
+        channelIds: ['timeline:public:local'],
+        options: { needsFiltering: true, notificationOnly: false },
+      });
+
       break;
     case 'public:remote':
-      streamFrom('timeline:public:remote', req, streamToWs(req, ws), streamWsEnd(req, ws), true);
+      resolve({
+        channelIds: ['timeline:public:remote'],
+        options: { needsFiltering: true, notificationOnly: false },
+      });
+
       break;
     case 'public:media':
-      streamFrom('timeline:public:media', req, streamToWs(req, ws), streamWsEnd(req, ws), true);
+      resolve({
+        channelIds: ['timeline:public:media'],
+        options: { needsFiltering: true, notificationOnly: false },
+      });
+
       break;
     case 'public:local:media':
-      streamFrom('timeline:public:local:media', req, streamToWs(req, ws), streamWsEnd(req, ws), true);
+      resolve({
+        channelIds: ['timeline:public:local:media'],
+        options: { needsFiltering: true, notificationOnly: false },
+      });
+
       break;
     case 'public:remote:media':
-      streamFrom('timeline:public:remote:media', req, streamToWs(req, ws), streamWsEnd(req, ws), true);
+      resolve({
+        channelIds: ['timeline:public:remote:media'],
+        options: { needsFiltering: true, notificationOnly: false },
+      });
+
       break;
     case 'direct':
-      channel = `timeline:direct:${req.accountId}`;
-      streamFrom(channel, req, streamToWs(req, ws), streamWsEnd(req, ws, subscriptionHeartbeat(channel)), true);
+      resolve({
+        channelIds: [`timeline:direct:${req.accountId}`],
+        options: { needsFiltering: false, notificationOnly: false },
+      });
+
       break;
     case 'hashtag':
-      if (!location.query.tag || location.query.tag.length === 0) {
-        ws.close();
-        return;
+      if (!params.tag || params.tag.length === 0) {
+        reject('No tag for stream provided');
+      } else {
+        resolve({
+          channelIds: [`timeline:hashtag:${params.tag.toLowerCase()}`],
+          options: { needsFiltering: true, notificationOnly: false },
+        });
       }
 
-      streamFrom(`timeline:hashtag:${location.query.tag.toLowerCase()}`, req, streamToWs(req, ws), streamWsEnd(req, ws), true);
       break;
     case 'hashtag:local':
-      if (!location.query.tag || location.query.tag.length === 0) {
-        ws.close();
+      if (!params.tag || params.tag.length === 0) {
+        reject('No tag for stream provided');
+      } else {
+        resolve({
+          channelIds: [`timeline:hashtag:${params.tag.toLowerCase()}:local`],
+          options: { needsFiltering: true, notificationOnly: false },
+        });
+      }
+
+      break;
+    case 'list':
+      authorizeListAccess(params.list, req).then(() => {
+        resolve({
+          channelIds: [`timeline:list:${params.list}`],
+          options: { needsFiltering: false, notificationOnly: false },
+        });
+      }).catch(() => {
+        reject('Not authorized to stream this list');
+      });
+
+      break;
+    default:
+      reject('Unknown stream type');
+    }
+  });
+
+  const streamNameFromChannelName = (channelName, params) => {
+    if (channelName === 'list') {
+      return [channelName, params.list];
+    } else if (['hashtag', 'hashtag:local'].includes(channelName)) {
+      return [channelName, params.tag];
+    } else {
+      return [channelName];
+    }
+  };
+
+  const subscribeWebsocketToChannel = ({ socket, request, subscriptions }, channelName, params) =>
+    checkScopes(request, channelName).then(() => channelNameToIds(request, channelName, params)).then(({ channelIds, options }) => {
+      if (subscriptions[channelIds.join(';')]) {
         return;
       }
 
-      streamFrom(`timeline:hashtag:${location.query.tag.toLowerCase()}:local`, req, streamToWs(req, ws), streamWsEnd(req, ws), true);
-      break;
-    case 'list':
-      const listId = location.query.list;
+      const onSend        = streamToWs(request, socket, streamNameFromChannelName(channelName, params));
+      const stopHeartbeat = subscriptionHeartbeat(channelIds);
+      const listener      = streamFrom(channelIds, request, onSend, false, options.needsFiltering, options.notificationOnly);
 
-      authorizeListAccess(listId, req, authorized => {
-        if (!authorized) {
-          ws.close();
-          return;
-        }
+      subscriptions[channelIds.join(';')] = {
+        listener,
+        stopHeartbeat,
+      };
+    }).catch(err => {
+      log.verbose(request.requestId, 'Subscription error:', err.toString());
+      socket.send(JSON.stringify({ error: err.toString() }));
+    });
 
-        channel = `timeline:list:${listId}`;
-        streamFrom(channel, req, streamToWs(req, ws), streamWsEnd(req, ws, subscriptionHeartbeat(channel)));
+  const unsubscribeWebsocketFromChannel = ({ socket, request, subscriptions }, channelName, params) =>
+    channelNameToIds(request, channelName, params).then(({ channelIds }) => {
+      log.verbose(request.requestId, `Ending stream from ${channelIds.join(', ')} for ${request.accountId}`);
+
+      const { listener, stopHeartbeat } = subscriptions[channelIds.join(';')];
+
+      if (!listener) {
+        return;
+      }
+
+      channelIds.forEach(channelId => {
+        unsubscribe(`${redisPrefix}${channelId}`, listener);
       });
-      break;
-    default:
-      ws.close();
-    }
+
+      stopHeartbeat();
+
+      subscriptions[channelIds.join(';')] = undefined;
+    }).catch(err => {
+      log.verbose(request.requestId, 'Unsubscription error:', err);
+      socket.send(JSON.stringify({ error: err.toString() }));
+    });
+
+  wss.on('connection', (ws, req) => {
+    const location = url.parse(req.url, true);
+
+    req.requestId     = uuid.v4();
+    req.remoteAddress = ws._socket.remoteAddress;
+
+    const session = {
+      socket: ws,
+      request: req,
+      subscriptions: {},
+    };
+
+    const onEnd = () => {
+      const keys = Object.keys(session.subscriptions);
+
+      keys.forEach(channelIds => {
+        const { listener, stopHeartbeat } = session.subscriptions[channelIds];
+
+        channelIds.split(';').forEach(channelId => {
+          unsubscribe(`${redisPrefix}${channelId}`, listener);
+        });
+
+        stopHeartbeat();
+      });
+    };
+
+    ws.on('close', onEnd);
+    ws.on('error', onEnd);
+
+    ws.on('message', data => {
+      const { type, stream, ...params } = JSON.parse(data);
+
+      if (type === 'subscribe') {
+        subscribeWebsocketToChannel(session, stream, params);
+      } else if (type === 'unsubscribe') {
+        unsubscribeWebsocketFromChannel(session, stream, params)
+      } else {
+        // Unknown action type
+      }
+    });
+
+    subscribeWebsocketToChannel(session, location.query.stream, location.query);
   });
 
   wss.startAutoPing(30000);
